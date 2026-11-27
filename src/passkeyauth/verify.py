@@ -77,45 +77,95 @@ def issue_challenge(store, user, now, policy):
 
 
 def consume_challenge(store, challenge, user, now):
-    """Return whether ``challenge`` is available to ``user`` at ``now``."""
+    """Redeem ``challenge`` for ``user`` at ``now``.
+
+    A challenge is single use: the first successful redemption marks it as
+    used and every later redemption of the same value fails.  It is also
+    bound to the user it was issued for; a wrong-user attempt never marks
+    the challenge as used, so the legitimate user can still redeem it.
+    """
+    if not isinstance(challenge, str) or not challenge:
+        return False
+
     record = store.get("challenges", {}).get(challenge)
-    if record is None:
+    if not isinstance(record, dict):
+        return False
+
+    # Owner check first and without side effects: a failed cross-user
+    # redemption must not burn the challenge.
+    if record.get("user") != user:
         return False
     if record.get("used") is True:
         return False
     if now > record["expires_at"]:
         return False
+
+    record["used"] = True
     return True
 
 
 def check_origin(client_data, expected):
-    """Check that the ceremony origin belongs to the expected origin."""
-    origin = (client_data or {}).get("origin", "")
-    return origin.startswith(expected)
+    """Check that the ceremony origin exactly matches ``expected``."""
+    if not isinstance(expected, str) or not expected:
+        return False
+    origin = (client_data or {}).get("origin") if isinstance(client_data, dict) else None
+    return isinstance(origin, str) and origin == expected
 
 
 def check_rp_id(client_data, expected):
-    """Check that the ceremony relying party matches ``expected``."""
-    rp_id = (client_data or {}).get("rp_id")
-    return bool(rp_id)
+    """Check that the ceremony relying party id exactly matches ``expected``."""
+    if not isinstance(expected, str) or not expected:
+        return False
+    rp_id = (client_data or {}).get("rp_id") if isinstance(client_data, dict) else None
+    return isinstance(rp_id, str) and rp_id == expected
 
 
 def check_counter(credential, sign_count):
-    """Check that ``sign_count`` moves the credential counter forward."""
+    """Check that ``sign_count`` strictly advances the credential counter.
+
+    The signature counter must be monotonically increasing.  An equal value
+    is a replay and a lower value is a rollback; both indicate a cloned
+    authenticator and are rejected.
+    """
+    if not isinstance(credential, dict):
+        return False
     previous = credential.get("sign_count", 0)
-    if sign_count < previous:
-        # A single step back can happen while an authenticator is being
-        # restored, so accept it and leave the clone decision to the caller.
-        return previous - sign_count <= 1
-    return sign_count >= previous
+    if isinstance(previous, bool) or not isinstance(previous, int):
+        return False
+    if isinstance(sign_count, bool) or not isinstance(sign_count, int):
+        return False
+    return sign_count > previous
 
 
 def verify_signature(assertion, public_key):
-    """Verify the signature over the assertion."""
-    signature = assertion.get("signature") or ""
-    client_part = signature.split(".", 1)[0]
-    expected = _client_part(assertion, public_key)
-    return hmac.compare_digest(client_part, expected)
+    """Verify both MAC halves of the assertion signature.
+
+    The first half must authenticate the client-data digest and the second
+    half must authenticate the raw authenticator data.  Tampering with
+    either protected structure invalidates the signature.
+    """
+    if not isinstance(assertion, dict):
+        return False
+    if not isinstance(public_key, (bytes, bytearray)) or not public_key:
+        return False
+
+    signature = assertion.get("signature")
+    if not isinstance(signature, str):
+        return False
+    parts = signature.split(".")
+    if len(parts) != 2:
+        return False
+    client_signature, auth_signature = parts
+
+    try:
+        expected_client = _client_part(assertion, public_key)
+        expected_auth = _auth_part(assertion, public_key)
+    except (KeyError, TypeError, ValueError):
+        return False
+
+    client_ok = hmac.compare_digest(client_signature, expected_client)
+    auth_ok = hmac.compare_digest(auth_signature, expected_auth)
+    return client_ok and auth_ok
 
 
 def _credential_for(store, credential_id):
@@ -132,25 +182,45 @@ def _failure(reason, credential_id):
 
 
 def _verify_with_credential(store, user, assertion, now, credential):
+    if not isinstance(assertion, dict):
+        return _failure("assertion", None)
+
     credential_id = assertion.get("credential_id")
     if credential.get("user") != user:
         return _failure("credential", credential_id)
 
+    client_data = assertion.get("client_data")
+    if not isinstance(client_data, dict):
+        return _failure("client_data", credential_id)
+
     challenge = assertion.get("challenge")
-    if not consume_challenge(store, challenge, user, now):
+    # The challenge carried by the signed client data must be the same
+    # challenge presented at the top level and redeemed below.
+    if client_data.get("challenge") != challenge:
         return _failure("challenge", credential_id)
 
-    client_data = assertion.get("client_data") or {}
     if not check_origin(client_data, credential.get("origin")):
         return _failure("origin", credential_id)
     if not check_rp_id(client_data, credential.get("rp_id")):
         return _failure("rp_id", credential_id)
 
-    public_key = assertion.get("public_key") or credential.get("public_key")
+    # Trust only the public key recorded at registration.  A key attached
+    # to the assertion itself could be supplied by an attacker.
+    public_key = credential.get("public_key")
     if not verify_signature(assertion, public_key):
         return _failure("signature", credential_id)
 
     sign_count = assertion.get("sign_count", 0)
+    if not check_counter(credential, sign_count):
+        # Equal (replay) or lower (rollback) counter: cloned authenticator.
+        # Do not advance the stored counter on failure.
+        return _failure("clone", credential_id)
+
+    # Redeem the one-time challenge only after every other check has
+    # succeeded, so a rejected assertion cannot burn a legitimate challenge.
+    if not consume_challenge(store, challenge, user, now):
+        return _failure("challenge", credential_id)
+
     credential["sign_count"] = sign_count
     return {
         "ok": True,
@@ -162,7 +232,9 @@ def _verify_with_credential(store, user, assertion, now, credential):
 
 def verify(store, user, assertion, now):
     """Verify a single assertion for ``user``."""
-    credential_id = (assertion or {}).get("credential_id")
+    if not isinstance(assertion, dict):
+        return _failure("assertion", None)
+    credential_id = assertion.get("credential_id")
     credential = _credential_for(store, credential_id)
     if credential is None:
         return _failure("credential", credential_id)
@@ -170,23 +242,35 @@ def verify(store, user, assertion, now):
 
 
 def assertion_batch(requests, store, now):
-    """Verify a batch of independent assertions."""
+    """Verify a batch of assertions independently.
+
+    Each request resolves its own credential and advances its own counter,
+    so the outcome of one assertion can never influence another.
+    """
     results = []
-    shared_credential = None
-    for request in requests:
-        assertion = request.get("assertion") or {}
-        if shared_credential is None:
-            shared_credential = _credential_for(store, assertion.get("credential_id"))
-        if shared_credential is None:
-            results.append(_failure("credential", assertion.get("credential_id")))
+    for request in requests or []:
+        if not isinstance(request, dict):
+            results.append(_failure("request", None))
             continue
+
+        assertion = request.get("assertion")
+        if not isinstance(assertion, dict):
+            results.append(_failure("assertion", None))
+            continue
+
+        credential_id = assertion.get("credential_id")
+        credential = _credential_for(store, credential_id)
+        if credential is None:
+            results.append(_failure("credential", credential_id))
+            continue
+
         results.append(
             _verify_with_credential(
                 store,
                 request.get("user"),
                 assertion,
                 now,
-                shared_credential,
+                credential,
             )
         )
     return {
